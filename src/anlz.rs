@@ -959,7 +959,8 @@ pub struct ANLZ {
 }
 
 impl ANLZ {
-    fn parse_sections<R: Read + Seek>(
+    /// Is this docs enough?
+    pub fn parse_sections<R: Read + Seek>(
         reader: &mut R,
         endian: Endian,
         args: (u32,),
