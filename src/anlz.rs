@@ -824,7 +824,7 @@ pub struct SongStructure {
     /// Song structure data.
     #[br(args(is_encrypted, len_entries), parse_with = SongStructureData::read_encrypted)]
     #[bw(args(*is_encrypted, len_entries), write_with = SongStructureData::write_encrypted)]
-    data: SongStructureData,
+    pub data: SongStructureData,
 }
 
 /// The data part of the [`SongStructure`] section that may be encrypted (RB6+).
