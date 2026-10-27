@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Jan Holthuis <jan.holthuis@rub.de>
+// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
 //
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
 // of the MPL was not distributed with this file, You can obtain one at
@@ -26,6 +26,8 @@
 
 #![allow(clippy::must_use_candidate)]
 
+#[cfg(feature = "json")]
+use crate::util::serialize_as_hex;
 use crate::{util::ColorIndex, xor::XorStream};
 use binrw::{
     binrw,
@@ -33,10 +35,21 @@ use binrw::{
     BinRead, BinResult, BinWrite, Endian, NullWideString,
 };
 use modular_bitfield::prelude::*;
+#[cfg(feature = "json")]
+use serde::{Serialize, Serializer};
+
+#[cfg(feature = "json")]
+fn serialize_null_wide_string<S>(nws: &NullWideString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&nws.to_string())
+}
 
 /// The kind of section.
 #[binrw]
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub enum ContentKind {
     /// File section that contains all other sections.
@@ -78,7 +91,7 @@ pub enum ContentKind {
     /// Used in `.EXT` files.
     #[brw(magic = b"PWV3")]
     WaveformDetail,
-    /// Fixed-width colored version of the track waveform.
+    /// Fixed-width colored preview of the track waveform.
     ///
     /// Used in `.EXT` files.
     #[brw(magic = b"PWV4")]
@@ -88,6 +101,21 @@ pub enum ContentKind {
     /// Used in `.EXT` files.
     #[brw(magic = b"PWV5")]
     WaveformColorDetail,
+    /// Fixed-width 3-band preview of the track waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[brw(magic = b"PWV6")]
+    Waveform3BandPreview,
+    /// Variable-width large 3-band version of the track waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[brw(magic = b"PWV7")]
+    Waveform3BandDetail,
+    /// Per-band gain calibration for the 3-band player waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[brw(magic = b"PWVC")]
+    Waveform3BandCalibration,
     /// Describes the structure of a sond (Intro, Chrous, Verse, etc.).
     ///
     /// Used in `.EXT` files.
@@ -103,6 +131,7 @@ pub enum ContentKind {
 /// Header of a section that contains type and size information.
 #[binrw]
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct Header {
     /// Kind of content in this item.
@@ -126,6 +155,7 @@ impl Header {
 /// A single beat inside the beat grid.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct Beat {
     /// Beat number inside the bar (1-4).
@@ -139,6 +169,7 @@ pub struct Beat {
 /// Describes the types of entries found in a Cue List section.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big, repr = u32)]
 pub enum CueListType {
     /// Memory cues or loops.
@@ -150,6 +181,7 @@ pub enum CueListType {
 /// Indicates if the cue is point or a loop.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(repr = u8)]
 pub enum CueType {
     /// Cue is a single point.
@@ -161,6 +193,7 @@ pub enum CueType {
 /// A memory or hot cue (or loop).
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct Cue {
     /// Cue entry header.
@@ -224,9 +257,114 @@ pub struct Cue {
     unknown7: u32,
 }
 
+/// A length-prefixed wide (UTF-16BE) string.
+///
+/// The binary representation is a `u32` length (in bytes, including the trailing
+/// NUL terminator) followed by that many bytes of UTF-16BE encoded text. The
+/// trailing NUL is stripped on read and appended on write.
+/// Its binary structure can be visualized as follows:
+///
+/// ```text
+/// | <length> (u32) | UTF-16BE encoded text | 0x0000 |
+///                   <------------------------------>
+///                            <length> bytes
+/// ```
+/// Used for the `comment` field in the `ExtendedCue` section.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+pub struct LenPrefixedWideString(pub String);
+
+impl LenPrefixedWideString {
+    /// Returns the number of bytes required to encode this string as UTF-16BE
+    /// with a trailing NUL terminator (excluding the length prefix).
+    #[must_use]
+    pub fn byte_len(&self) -> u32 {
+        if self.0.is_empty() {
+            0
+        } else {
+            (self.0.encode_utf16().count() as u32 + 1) * 2
+        }
+    }
+}
+
+impl From<String> for LenPrefixedWideString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for LenPrefixedWideString {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::ops::Deref for LenPrefixedWideString {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl BinRead for LenPrefixedWideString {
+    type Args<'a> = ();
+
+    fn read_options<R: Read + Seek>(
+        reader: &mut R,
+        endian: Endian,
+        _args: Self::Args<'_>,
+    ) -> BinResult<Self> {
+        let len: u32 = u32::read_options(reader, endian, ())?;
+        let len = len as usize;
+        if len == 0 {
+            return Ok(Self(String::new()));
+        }
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes)?;
+        let code_units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        let s = String::from_utf16(&code_units)
+            .map(|s| s.trim_end_matches('\0').to_string())
+            .map_err(|e| binrw::Error::Custom {
+                pos: reader.stream_position().unwrap_or(0),
+                err: Box::new(e),
+            })?;
+        Ok(Self(s))
+    }
+}
+
+impl BinWrite for LenPrefixedWideString {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        _args: Self::Args<'_>,
+    ) -> BinResult<()> {
+        let bl = self.byte_len();
+        bl.write_options(writer, endian, ())?;
+        if bl > 0 {
+            let mut bytes: Vec<u8> = Vec::new();
+            for cu in self.0.encode_utf16() {
+                bytes.extend_from_slice(&cu.to_be_bytes());
+            }
+            bytes.extend_from_slice(&[0, 0]);
+            writer.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+}
+
 /// A memory or hot cue (or loop).
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct ExtendedCue {
     /// Cue entry header.
@@ -264,13 +402,9 @@ pub struct ExtendedCue {
     pub loop_numerator: u16,
     /// Represents the loop size denominator (if this is a quantized loop).
     pub loop_denominator: u16,
-    /// Length of the comment string in bytes.
-    #[br(temp)]
-    #[bw(calc = (comment.len() as u32 + 1) * 2)]
-    len_comment: u32,
-    /// An UTF-16BE encoded string, followed by a trailing  `0x0000`.
-    #[br(assert((comment.len() as u32 + 1) * 2 == len_comment))]
-    pub comment: NullWideString,
+    /// An UTF-16BE encoded string with a leading `u32` length prefix and a
+    /// trailing NUL (`0x0000`).
+    pub comment: LenPrefixedWideString,
     /// Rekordbox hotcue color index.
     ///
     /// | Value  | Color                       |
@@ -339,7 +473,7 @@ pub struct ExtendedCue {
     /// | `0x3d` | `#8272ff`                   |
     /// | `0x3e` | `#6473ff`                   |
     pub hot_cue_color_index: u8,
-    /// Rekordbot hot cue color RGB value.
+    /// Rekordbox hot cue color RGB value.
     ///
     /// This color is similar but not identical to the color that Rekordbox displays, and possibly
     /// used to illuminate the RGB LEDs in a player that has loaded the cue. If not color is
@@ -355,6 +489,12 @@ pub struct ExtendedCue {
     unknown9: u32,
     /// Unknown field.
     unknown10: u32,
+    /// Trailing unknown bytes after `unknown10` to the end of the entry.
+    ///
+    /// Per the Kaitai spec, the entry may contain extra data beyond the known fields;
+    /// any remaining bytes are captured here.
+    #[br(count = header.total_size.saturating_sub(68 + comment.byte_len()) as usize)]
+    pub trailing: Vec<u8>,
 }
 
 impl Default for WaveformPreviewColumn {
@@ -364,6 +504,9 @@ impl Default for WaveformPreviewColumn {
 }
 
 /// Single Column value in a Waveform Preview.
+///
+/// See these the documentation for details:
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#waveform-preview-tag>
 #[bitfield]
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
 #[br(big, map = Self::from_bytes)]
@@ -375,6 +518,20 @@ pub struct WaveformPreviewColumn {
     pub whiteness: B3,
 }
 
+#[cfg(feature = "json")]
+impl Serialize for WaveformPreviewColumn {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("WaveformPreviewColumn", 2)?;
+        state.serialize_field("height", &self.height())?;
+        state.serialize_field("whiteness", &self.whiteness())?;
+        state.end()
+    }
+}
+
 impl Default for TinyWaveformPreviewColumn {
     fn default() -> Self {
         Self::new()
@@ -382,23 +539,41 @@ impl Default for TinyWaveformPreviewColumn {
 }
 
 /// Single Column value in a Tiny Waveform Preview.
+///
+/// See these the documentation for details:
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#tiny-preview>
 #[bitfield]
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
 #[br(big, map = Self::from_bytes)]
 #[bw(big, map = |x: &TinyWaveformPreviewColumn| x.into_bytes())]
 pub struct TinyWaveformPreviewColumn {
-    #[allow(dead_code)]
-    unused: B4,
     /// Height of the Column in pixels.
     pub height: B4,
+    #[allow(dead_code)]
+    unused: B4,
+}
+
+#[cfg(feature = "json")]
+impl Serialize for TinyWaveformPreviewColumn {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TinyWaveformPreviewColumn", 2)?;
+        state.serialize_field("unused", &self.unused())?;
+        state.serialize_field("height", &self.height())?;
+        state.end()
+    }
 }
 
 /// Single Column value in a Waveform Color Preview.
 ///
 /// See these the documentation for details:
-/// <https://djl-analysis.deepsymmetry.org/djl-analysis/track_metadata.html#color-preview-analysis>
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#color-preview>
 #[binrw]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct WaveformColorPreviewColumn {
     /// Unknown field (somehow encodes the "whiteness").
@@ -422,8 +597,12 @@ impl Default for WaveformColorDetailColumn {
 }
 
 /// Single Column value in a Waveform Color Detail section.
+///
+/// See the documentation for details:
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#color-detail>
 #[bitfield]
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(map = Self::from_bytes)]
 #[bw(big, map = |x: &WaveformColorDetailColumn| x.into_bytes())]
 pub struct WaveformColorDetailColumn {
@@ -433,17 +612,64 @@ pub struct WaveformColorDetailColumn {
     pub green: B3,
     /// Blue color component.
     pub blue: B3,
-    /// Height of the column.
+    /// Coarse column height.
     pub height: B5,
-    /// Unknown field
-    #[allow(dead_code)]
-    unknown: B2,
+    /// Fine height sub-steps.
+    pub low_bits: B2,
+}
+
+impl WaveformColorDetailColumn {
+    /// Fine height sub-step with the observed significance ordering.
+    pub fn fine_height_substep(&self) -> u8 {
+        let low = self.low_bits();
+        ((low & 1) << 1) | ((low >> 1) & 1)
+    }
+
+    /// Full height formed from the 5-bit coarse height plus the reordered fine-height bits.
+    pub fn full_height(&self) -> u8 {
+        (self.height() << 2) | self.fine_height_substep()
+    }
+}
+
+/// Single Column value in a Waveform 3-Band Preview.
+///
+/// See these the documentation for details:
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#three-band-preview>
+#[binrw]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+#[brw(big)]
+pub struct Waveform3BandPreviewColumn {
+    /// Sound energy in the bottom third of the frequency range.
+    pub energy_bottom_third_freq: u8,
+    /// Sound energy in the mid of the frequency range.
+    pub energy_mid_third_freq: u8,
+    /// Sound energy in the top of the frequency range.
+    pub energy_top_third_freq: u8,
+}
+
+/// Single Column value in a Waveform 3-Band Detail section.
+///
+/// See these the documentation for details:
+/// <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#three-band-detail>
+#[binrw]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+#[brw(big)]
+pub struct Waveform3BandDetailColumn {
+    /// Sound energy in the bottom third of the frequency range.
+    pub energy_bottom_third_freq: u8,
+    /// Sound energy in the mid of the frequency range.
+    pub energy_mid_third_freq: u8,
+    /// Sound energy in the top of the frequency range.
+    pub energy_top_third_freq: u8,
 }
 
 /// Music classification that is used for Lightnight mode and based on rhythm, tempo kick drum and
 /// sound density.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big, repr = u16)]
 pub enum Mood {
     /// Phrase types consist of "Intro", "Up", "Down", "Chorus", and "Outro". Other values in each
@@ -463,6 +689,7 @@ pub enum Mood {
 /// Stylistic track bank for Lightning mode.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(repr = u8)]
 pub enum Bank {
     /// Default bank variant, treated as `Cool`.
@@ -488,6 +715,7 @@ pub enum Bank {
 /// A song structure entry that represents a phrase in the track.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct Phrase {
     /// Phrase number (starting at 1).
@@ -544,6 +772,7 @@ pub struct Phrase {
 /// Section content which differs depending on the section type.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub enum Content {
     /// All beats in the track.
@@ -575,7 +804,7 @@ pub enum Content {
     /// Used in `.EXT` files.
     #[br(pre_assert(header.kind == ContentKind::WaveformDetail))]
     WaveformDetail(#[br(args(header.clone()))] WaveformDetail),
-    /// Variable-width large monochrome version of the track waveform.
+    /// Fixed-width colored preview of the track waveform.
     ///
     /// Used in `.EXT` files.
     #[br(pre_assert(header.kind == ContentKind::WaveformColorPreview))]
@@ -585,6 +814,21 @@ pub enum Content {
     /// Used in `.EXT` files.
     #[br(pre_assert(header.kind == ContentKind::WaveformColorDetail))]
     WaveformColorDetail(#[br(args(header.clone()))] WaveformColorDetail),
+    /// Variable-width large monochrome version of the track waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[br(pre_assert(header.kind == ContentKind::Waveform3BandPreview))]
+    Waveform3BandPreview(#[br(args(header.clone()))] Waveform3BandPreview),
+    /// Variable-width large 3-band version of the track waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[br(pre_assert(header.kind == ContentKind::Waveform3BandDetail))]
+    Waveform3BandDetail(#[br(args(header.clone()))] Waveform3BandDetail),
+    /// Per-band gain calibration for the 3-band player waveform.
+    ///
+    /// Used in `.2EX` files.
+    #[br(pre_assert(header.kind == ContentKind::Waveform3BandCalibration))]
+    Waveform3BandCalibration(#[br(args(header.clone()))] Waveform3BandCalibration),
     /// Describes the structure of a sond (Intro, Chrous, Verse, etc.).
     ///
     /// Used in `.EXT` files.
@@ -601,6 +845,7 @@ pub enum Content {
 /// All beats in the track.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 pub struct BeatGrid {
     /// Unknown field.
     unknown1: u32,
@@ -611,6 +856,7 @@ pub struct BeatGrid {
     /// Number of beats in this beatgrid.
     #[br(temp)]
     #[bw(calc = beats.len() as u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_beats: u32,
     /// Beats in this beatgrid.
     #[br(count = len_beats)]
@@ -620,6 +866,7 @@ pub struct BeatGrid {
 /// List of cue points or loops (either hot cues or memory cues).
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 pub struct CueList {
     /// The types of cues (memory or hot) that this list contains.
     pub list_type: CueListType,
@@ -628,6 +875,7 @@ pub struct CueList {
     /// Number of cues.
     #[br(temp)]
     #[bw(calc = cues.len() as u16)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_cues: u16,
     /// Unknown field.
     memory_count: u32,
@@ -642,12 +890,14 @@ pub struct CueList {
 /// comments and colors. Introduces with the Nexus 2 series players.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 pub struct ExtendedCueList {
     /// The types of cues (memory or hot) that this list contains.
     pub list_type: CueListType,
     /// Number of cues.
     #[br(temp)]
     #[bw(calc = cues.len() as u16)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_cues: u16,
     /// Unknown field
     #[br(assert(unknown == 0))]
@@ -660,40 +910,47 @@ pub struct ExtendedCueList {
 /// Path of the audio file that this analysis belongs to.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct Path {
     /// Length of the path field in bytes.
     #[br(temp)]
     #[br(assert(len_path == header.content_size()))]
     #[bw(calc = ((path.len() as u32) + 1) * 2)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_path: u32,
     /// Path of the audio file.
     #[br(assert(len_path == header.content_size()))]
     #[br(assert((path.len() as u32 + 1) * 2 == len_path))]
+    #[cfg_attr(feature = "json", serde(serialize_with = "serialize_null_wide_string"))]
     pub path: NullWideString,
 }
 
 /// Seek information for variable bitrate files (probably).
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct VBR {
     /// Unknown field.
     unknown1: u32,
     /// Unknown data.
     #[br(count = header.content_size())]
+    #[cfg_attr(feature = "json", serde(serialize_with = "serialize_as_hex"))]
     unknown2: Vec<u8>,
 }
 
 /// Fixed-width monochrome preview of the track waveform.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct WaveformPreview {
     /// Unknown field.
     #[br(temp)]
     #[br(assert(len_preview == header.content_size()))]
     #[bw(calc = data.len() as u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_preview: u32,
     /// Unknown field (apparently always `0x00100000`)
     unknown: u32,
@@ -705,12 +962,14 @@ pub struct WaveformPreview {
 /// Smaller version of the fixed-width monochrome preview of the track waveform.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct TinyWaveformPreview {
     /// Unknown field.
     #[br(temp)]
     #[br(assert(len_preview == header.content_size()))]
     #[bw(calc = data.len() as u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_preview: u32,
     /// Unknown field (apparently always `0x00100000`)
     unknown: u32,
@@ -724,17 +983,20 @@ pub struct TinyWaveformPreview {
 /// Used in `.EXT` files.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct WaveformDetail {
     /// Size of a single entry, always 1.
     #[br(temp)]
     #[br(assert(len_entry_bytes == 1))]
     #[bw(calc = 1u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entry_bytes: u32,
     /// Number of entries in this section.
     #[br(temp)]
     #[bw(calc = data.len() as u32)]
     #[br(assert((len_entry_bytes * len_entries)== header.content_size()))]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entries: u32,
     /// Unknown field (apparently always `0x00960000`)
     #[br(assert(unknown == 0x00960000))]
@@ -747,29 +1009,29 @@ pub struct WaveformDetail {
     pub data: Vec<WaveformPreviewColumn>,
 }
 
-/// Variable-width large monochrome version of the track waveform.
+/// Smaller version of the fixed-width colored preview of the track waveform.
 ///
 /// Used in `.EXT` files.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct WaveformColorPreview {
     /// Size of a single entry, always 6.
     #[br(temp)]
     #[br(assert(len_entry_bytes == 6))]
     #[bw(calc = 6u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entry_bytes: u32,
     /// Number of entries in this section.
     #[br(temp)]
     #[bw(calc = data.len() as u32)]
     #[br(assert((len_entry_bytes * len_entries) == header.content_size()))]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entries: u32,
     /// Unknown field.
     unknown: u32,
     /// Waveform preview column data.
-    ///
-    /// Each entry represents one half-frame of audio data, and there are 75 frames per second,
-    /// so for each second of track audio there are 150 waveform detail entries.
     #[br(count = len_entries)]
     pub data: Vec<WaveformColorPreviewColumn>,
 }
@@ -779,23 +1041,109 @@ pub struct WaveformColorPreview {
 /// Used in `.EXT` files.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct WaveformColorDetail {
     /// Size of a single entry, always 2.
     #[br(temp)]
     #[br(assert(len_entry_bytes == 2))]
     #[bw(calc = 2u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entry_bytes: u32,
     /// Number of entries in this section.
     #[br(temp)]
     #[bw(calc = data.len() as u32)]
     #[br(assert((len_entry_bytes * len_entries) == header.content_size()))]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entries: u32,
     /// Unknown field.
     unknown: u32,
     /// Waveform detail column data.
+    ///
+    /// Each entry represents one half-frame of audio data, and there are 75 frames per second,
+    /// so for each second of track audio there are 150 waveform detail entries.
     #[br(count = len_entries)]
     pub data: Vec<WaveformColorDetailColumn>,
+}
+
+/// Smaller version of the fixed-width 3-band preview of the track waveform.
+///
+/// Used in `.2EX` files.
+#[binrw]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+#[br(import(header: Header))]
+pub struct Waveform3BandPreview {
+    /// Size of a single entry, always 3.
+    #[br(temp)]
+    #[br(assert(len_entry_bytes == 3))]
+    #[bw(calc = 3u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
+    len_entry_bytes: u32,
+    /// Number of entries in this section.
+    #[br(temp)]
+    #[bw(calc = data.len() as u32)]
+    #[br(assert((len_entry_bytes * len_entries) == header.content_size()))]
+    #[cfg_attr(feature = "json", serde(skip))]
+    len_entries: u32,
+    /// Waveform preview column data.
+    #[br(count = len_entries)]
+    pub data: Vec<Waveform3BandPreviewColumn>,
+}
+
+/// Variable-width large 3-band version of the track waveform.
+///
+/// Used in `.2EX` files.
+#[binrw]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+#[br(import(header: Header))]
+pub struct Waveform3BandDetail {
+    /// Size of a single entry, always 3.
+    #[br(temp)]
+    #[br(assert(len_entry_bytes == 3))]
+    #[bw(calc = 3u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
+    len_entry_bytes: u32,
+    /// Number of entries in this section.
+    #[br(temp)]
+    #[bw(calc = data.len() as u32)]
+    #[br(assert((len_entry_bytes * len_entries) == header.content_size()))]
+    #[cfg_attr(feature = "json", serde(skip))]
+    len_entries: u32,
+    /// Unknown field (apparently always `0x00960000`)
+    #[br(assert(unknown == 0x00960000))]
+    #[bw(calc = 0x00960000u32)]
+    unknown: u32,
+    /// Waveform detail column data.
+    ///
+    /// Each entry represents one half-frame of audio data, and there are 75 frames per second,
+    /// so for each second of track audio there are 150 waveform detail entries.
+    #[br(count = len_entries)]
+    pub data: Vec<Waveform3BandDetailColumn>,
+}
+
+/// Per-band gain calibration for the 3-band player waveform.
+///
+/// Used in `.2EX` files.
+#[binrw]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
+#[br(import(header: Header))]
+pub struct Waveform3BandCalibration {
+    /// Reserved field. Observed Rekordbox exports always set this to `0`.
+    #[br(temp)]
+    #[br(assert(header.remaining_size() == 2))]
+    #[br(assert(reserved == 0))]
+    #[bw(calc = 0u16)]
+    reserved: u16,
+    /// Gain applied to the low / blue waveform band.
+    #[br(assert(header.content_size() == 6))]
+    pub low_gain: u16,
+    /// Gain applied to the mid / yellow waveform band.
+    pub mid_gain: u16,
+    /// Gain applied to the high / white waveform band.
+    pub high_gain: u16,
 }
 
 /// Describes the structure of a song (Intro, Chrous, Verse, etc.).
@@ -803,23 +1151,27 @@ pub struct WaveformColorDetail {
 /// Used in `.EXT` files.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct SongStructure {
     /// Size of a single entry, always 24.
     #[br(temp)]
     #[br(assert(len_entry_bytes == 24))]
     #[bw(calc = 24u32)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entry_bytes: u32,
     /// Number of entries in this section.
     #[br(temp)]
     #[br(assert((len_entry_bytes * (len_entries as u32)) == header.content_size()))]
     #[bw(calc = data.phrases.len() as u16)]
+    #[cfg_attr(feature = "json", serde(skip))]
     len_entries: u16,
     /// Indicates if the remaining parts of the song structure section are encrypted.
     ///
     /// This is a virtual field and not actually present in the file.
     #[br(restore_position, map = |raw_mood: [u8; 2]| SongStructureData::check_if_encrypted(raw_mood, len_entries))]
     #[bw(ignore)]
+    #[cfg_attr(feature = "json", serde(skip))]
     is_encrypted: bool,
     /// Song structure data.
     #[br(args(is_encrypted, len_entries), parse_with = SongStructureData::read_encrypted)]
@@ -833,6 +1185,7 @@ pub struct SongStructure {
 /// - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#song-structure-tag>
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(len_entries: u16))]
 pub struct SongStructureData {
     /// Overall type of phrase structure.
@@ -918,6 +1271,7 @@ impl SongStructureData {
 /// Unknown content.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[br(import(header: Header))]
 pub struct Unknown {
     /// Unknown header data.
@@ -931,6 +1285,7 @@ pub struct Unknown {
 /// ANLZ Section.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 pub struct Section {
     /// The header.
     pub header: Header,
@@ -945,6 +1300,7 @@ pub struct Section {
 /// `ANLZ::sections()` method.
 #[binrw]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(Serialize))]
 #[brw(big)]
 pub struct ANLZ {
     /// The file header.
@@ -952,6 +1308,7 @@ pub struct ANLZ {
     pub header: Header,
     /// The header data.
     #[br(count = header.remaining_size())]
+    #[cfg_attr(feature = "json", serde(serialize_with = "serialize_as_hex"))]
     pub header_data: Vec<u8>,
     /// The content sections.
     #[br(parse_with = Self::parse_sections, args(header.content_size()))]
@@ -975,5 +1332,359 @@ impl ANLZ {
         }
 
         Ok(sections)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::testing::test_roundtrip;
+    use std::io::Cursor;
+
+    #[test]
+    fn extended_cue_empty_comment_roundtrip() {
+        // Real ExtendedCue with an empty comment (len_comment=0), extracted
+        // from a file provided by @FizzyApple12
+        // This would have failed to parse before the fix that replaced
+        // NullWideString with LenPrefixedWideString for the `comment` field.
+        let raw = [
+            0x50, 0x43, 0x50, 0x32, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00,
+            0x00, 0x04, 0x01, 0x00, 0x03, 0xe8, 0x00, 0x04, 0x62, 0xf7, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x4d, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc1, 0x70, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x30,
+            0x77, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let cue = ExtendedCue {
+            header: Header {
+                kind: ContentKind::ExtendedCue,
+                size: 16,
+                total_size: 88,
+            },
+            hot_cue: 4,
+            cue_type: CueType::Point,
+            unknown1: 0,
+            unknown2: 1000,
+            time: 287479,
+            loop_time: 4294967295,
+            color: ColorIndex::None,
+            unknown3: 1,
+            unknown4: 0,
+            unknown5: 0,
+            loop_numerator: 0,
+            loop_denominator: 0,
+            comment: LenPrefixedWideString(String::new()),
+            hot_cue_color_index: 0,
+            hot_cue_color_rgb: (0x4d, 0x00, 0xff),
+            unknown6: 0,
+            unknown7: 0x00c17000,
+            unknown8: 0,
+            unknown9: 0,
+            unknown10: 0,
+            trailing: vec![
+                0x02, 0x30, 0x77, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        };
+
+        test_roundtrip(&raw, cue);
+    }
+
+    #[test]
+    fn waveform_color_calibration_roundtrips() {
+        let header_data = [0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        let file_header_size = 12 + header_data.len() as u32;
+        let calibration = Section {
+            header: Header {
+                kind: ContentKind::Waveform3BandCalibration,
+                size: 14,
+                total_size: 20,
+            },
+            content: Content::Waveform3BandCalibration(Waveform3BandCalibration {
+                low_gain: 80,
+                mid_gain: 100,
+                high_gain: 100,
+            }),
+        };
+        let anlz = ANLZ {
+            header: Header {
+                kind: ContentKind::File,
+                size: file_header_size,
+                total_size: file_header_size + calibration.header.total_size,
+            },
+            header_data: header_data.to_vec(),
+            sections: vec![calibration],
+        };
+
+        let mut cursor = Cursor::new(Vec::new());
+        anlz.write(&mut cursor).unwrap();
+        let parsed = ANLZ::read(&mut Cursor::new(cursor.into_inner())).unwrap();
+        let calibration = parsed
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::Waveform3BandCalibration(calibration) => Some(calibration),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                calibration.low_gain,
+                calibration.mid_gain,
+                calibration.high_gain
+            ),
+            (80, 100, 100)
+        );
+    }
+
+    #[test]
+    fn waveform_high_resolution_sections_roundtrip() {
+        let header_data = [0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        let file_header_size = 12 + header_data.len() as u32;
+        let preview = Section {
+            header: Header {
+                kind: ContentKind::Waveform3BandPreview,
+                size: 20,
+                total_size: 26,
+            },
+            content: Content::Waveform3BandPreview(Waveform3BandPreview {
+                data: vec![
+                    Waveform3BandPreviewColumn {
+                        energy_bottom_third_freq: 0x01,
+                        energy_mid_third_freq: 0x02,
+                        energy_top_third_freq: 0x03,
+                    },
+                    Waveform3BandPreviewColumn {
+                        energy_bottom_third_freq: 0x10,
+                        energy_mid_third_freq: 0x20,
+                        energy_top_third_freq: 0x30,
+                    },
+                ],
+            }),
+        };
+        let detail = Section {
+            header: Header {
+                kind: ContentKind::Waveform3BandDetail,
+                size: 24,
+                total_size: 27,
+            },
+            content: Content::Waveform3BandDetail(Waveform3BandDetail {
+                data: vec![Waveform3BandDetailColumn {
+                    energy_bottom_third_freq: 0xaa,
+                    energy_mid_third_freq: 0xbb,
+                    energy_top_third_freq: 0xcc,
+                }],
+            }),
+        };
+        let anlz = ANLZ {
+            header: Header {
+                kind: ContentKind::File,
+                size: file_header_size,
+                total_size: file_header_size + preview.header.total_size + detail.header.total_size,
+            },
+            header_data: header_data.to_vec(),
+            sections: vec![preview, detail],
+        };
+
+        let mut cursor = Cursor::new(Vec::new());
+        anlz.write(&mut cursor).unwrap();
+        let parsed = ANLZ::read(&mut Cursor::new(cursor.into_inner())).unwrap();
+
+        let preview = parsed
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::Waveform3BandPreview(preview) => Some(preview),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            preview.data,
+            vec![
+                Waveform3BandPreviewColumn {
+                    energy_bottom_third_freq: 0x01,
+                    energy_mid_third_freq: 0x02,
+                    energy_top_third_freq: 0x03,
+                },
+                Waveform3BandPreviewColumn {
+                    energy_bottom_third_freq: 0x10,
+                    energy_mid_third_freq: 0x20,
+                    energy_top_third_freq: 0x30,
+                },
+            ]
+        );
+
+        let detail = parsed
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::Waveform3BandDetail(detail) => Some(detail),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            detail.data,
+            vec![Waveform3BandDetailColumn {
+                energy_bottom_third_freq: 0xaa,
+                energy_mid_third_freq: 0xbb,
+                energy_top_third_freq: 0xcc,
+            }]
+        );
+    }
+
+    #[test]
+    fn rgb_waveform_detail_column_roundtrips_bytes() {
+        let entry = WaveformColorDetailColumn::from_bytes([0xd1, 0x48]);
+        assert_eq!(entry.red(), 1);
+        assert_eq!(entry.green(), 2);
+        assert_eq!(entry.blue(), 3);
+        assert_eq!(entry.height(), 4);
+        assert_eq!(entry.low_bits(), 1);
+        assert_eq!(entry.into_bytes(), [0xd1, 0x48]);
+    }
+
+    /// The sweep fixture was generated by analyzing a frequency sweep from 20 kHz down to 20 Hz,
+    /// repeated three times (stereo, left channel, right channel). This means that at the
+    /// beginning of the track, almost all energy is in the high frequency band, while energy
+    /// shifts to the mid band around 15% and to the low band around 25% of the track duration.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Band {
+        Low,
+        Mid,
+        High,
+    }
+
+    const SWEEP_EXPECTATIONS: [(f32, Band); 3] =
+        [(0.05, Band::High), (0.15, Band::Mid), (0.25, Band::Low)];
+
+    /// Asserts that the given column encodes the expected dominant frequency band, and that
+    /// the dominant band carries almost all of the column's energy.
+    fn assert_sweep_column_band(
+        fraction: f32,
+        expected_band: Band,
+        section: &str,
+        low: u16,
+        mid: u16,
+        high: u16,
+    ) {
+        let dominant = if low >= mid && low >= high {
+            Band::Low
+        } else if mid >= high {
+            Band::Mid
+        } else {
+            Band::High
+        };
+        assert_eq!(dominant, expected_band, "{section} at {fraction}");
+        let total = low + mid + high;
+        let dominant_energy = match dominant {
+            Band::Low => low,
+            Band::Mid => mid,
+            Band::High => high,
+        };
+        assert!(
+            dominant_energy * 2 > total,
+            "{section} at {fraction}: dominant band carries less than half the energy \
+             (low={low}, mid={mid}, high={high})"
+        );
+    }
+
+    /// The monochrome previews (PWAV and PWV2) in the .DAT file do not encode frequency band
+    /// information, but their structure should parse with the expected number of columns.
+    #[test]
+    fn sweep_fixture_dat_monochrome_previews() {
+        let dat_data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/anlz/sweep/ANLZ0000.DAT"
+        ))
+        .unwrap();
+        let anlz = ANLZ::read(&mut Cursor::new(&dat_data)).unwrap();
+
+        let preview = anlz
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::WaveformPreview(preview) => Some(preview),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(preview.data.len(), 400);
+        assert!(preview.data.iter().any(|column| column.height() > 0));
+
+        let tiny_preview = anlz
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::TinyWaveformPreview(preview) => Some(preview),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tiny_preview.data.len(), 100);
+        assert!(tiny_preview.data.iter().any(|column| column.height() > 0));
+    }
+
+    /// The .EXT file contains the RGB color preview (PWV4).
+    #[test]
+    fn sweep_fixture_ext_rgb_preview_bands() {
+        let ext_data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/anlz/sweep/ANLZ0000.EXT"
+        ))
+        .unwrap();
+        let anlz = ANLZ::read(&mut Cursor::new(&ext_data)).unwrap();
+        let rgb_preview = anlz
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::WaveformColorPreview(preview) => Some(preview),
+                _ => None,
+            })
+            .unwrap();
+        let rgb_columns = &rgb_preview.data;
+        assert_eq!(rgb_columns.len(), 1200);
+        for (fraction, expected_band) in SWEEP_EXPECTATIONS {
+            let column = &rgb_columns[(rgb_columns.len() as f32 * fraction) as usize];
+            assert_sweep_column_band(
+                fraction,
+                expected_band,
+                "PWV4",
+                u16::from(column.energy_bottom_third_freq),
+                u16::from(column.energy_mid_third_freq),
+                u16::from(column.energy_top_third_freq),
+            );
+        }
+    }
+
+    /// The .2EX file contains the 3-band preview (PWV6).
+    #[test]
+    fn sweep_fixture_2ex_three_band_preview_bands() {
+        let two_ex_data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/anlz/sweep/ANLZ0000.2EX"
+        ))
+        .unwrap();
+        let anlz = ANLZ::read(&mut Cursor::new(&two_ex_data)).unwrap();
+        let three_band_preview = anlz
+            .sections
+            .iter()
+            .find_map(|section| match &section.content {
+                Content::Waveform3BandPreview(preview) => Some(preview),
+                _ => None,
+            })
+            .unwrap();
+        let three_band_columns = &three_band_preview.data;
+        assert_eq!(three_band_columns.len(), 1200);
+        for (fraction, expected_band) in SWEEP_EXPECTATIONS {
+            let column = &three_band_columns[(three_band_columns.len() as f32 * fraction) as usize];
+            assert_sweep_column_band(
+                fraction,
+                expected_band,
+                "PWV6",
+                u16::from(column.energy_bottom_third_freq),
+                u16::from(column.energy_mid_third_freq),
+                u16::from(column.energy_top_third_freq),
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Jan Holthuis <jan.holthuis@rub.de>
+// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
 //
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
 // of the MPL was not distributed with this file, You can obtain one at
@@ -24,11 +24,13 @@
 #![cfg_attr(not(debug_assertions), deny(clippy::used_underscore_binding))]
 
 pub mod anlz;
+pub mod device;
 pub mod pdb;
 pub mod setting;
 pub mod util;
 pub mod xml;
 pub(crate) mod xor;
 
+pub use crate::device::DeviceExportLoader;
 pub use crate::util::RekordcrateError as Error;
 pub use crate::util::RekordcrateResult as Result;

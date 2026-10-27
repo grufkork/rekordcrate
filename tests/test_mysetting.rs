@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Jan Holthuis <jan.holthuis@rub.de>
+// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
 //
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
 // of the MPL was not distributed with this file, You can obtain one at
@@ -14,7 +14,8 @@ macro_rules! read_mysetting {
         let data = include_bytes!($path);
         println!("Setting file: {}", $path);
         let mut reader = Cursor::new(data);
-        let setting = Setting::read(&mut reader).expect("failed to parse setting file");
+        let setting = Setting::read_args(&mut reader, (SettingType::MySetting,))
+            .expect("failed to parse setting file");
         let result = match setting.data {
             SettingData::MySetting(x) => Some(x),
             _ => None,

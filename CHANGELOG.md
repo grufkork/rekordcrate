@@ -2,6 +2,144 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### Bug Fixes
+
+- Plain Hotcues being rejected due to cuetype mismatch
+- pdb: Change padding logic for track rows
+- pdb: Pass parsing stage of track_page test
+- pdb: Apply review feedback for 3d5d57c
+- pdb: Validate row count in RowGroup to avoid silent overflow
+- pdb: Allow unused method to pass CI
+- pdb: Pass track_page test by not reversing in present_rows
+- pdb: Re-add comments removed during merge
+- pdb: Pass 5 more test_pdb_num_rows* tests
+- Doctest broken by previous string refactor commit
+- pdb: All tests pass + clean up comments
+- pdb: Apply review feedback for 78ee51c
+- pdb: Accept review feedback for 969d507
+- `genres_page` test offset padding and rowgroup ordering
+- pdb: WIP pass artists_page test
+- Add `ofs_name` field to Album row and correctly (de-)serialize it
+- pdb: Set fixed 4-byte alignment on labels
+- pdb: Set 4-byte alignment for Artwork rows
+- pdb: Increase struct fields visibility in ext.rs for use in tests
+- pdb: Add padding field to tag struct
+- pdb: Set fixed 4-byte alignment for tag rows
+- pdb: Add mapping for optional NonZero<u32> in ParentId struct
+- pdb: Explicit pattern matching to avoid extra `clone()`
+- pdb: Custom `BinWrite` for `IndexPageContent` to comply with binary
+- pdb: Address feedback by @Swiftb0y
+- pdb: Only allow PageIndex values less than 0x03FF_FFFF
+- Fix various compiler or clippy warnings with Rust 1.90
+- device: Load_settings, don't fail if settings files are missing
+- Build status badge/shield
+- anlz: Change type of `comment` field and capture trailing bytes
+- xml: Do not error on empty playlist nodes
+- pdb: Align Ucs2le strings to 4 bytes
+- cli: Make DumpFormat impl ValueEnum without the json feature
+- anlz: Correct waveform data structure bugs and add missing PWVC section
+- Correct frequency band mapping in waveform previews
+
+### Documentation
+
+- pdb: Add doc comments for struct fields in ext.rs
+- Link to upstream Tag row docs in docs
+- pdb: Enhance documentation for some index page fields
+- Fix comment for Track enum variant
+
+### Features
+
+- Use "clean" buffer in `track_page` test & refactor `DeviceSQLString` construction
+- Add `artist_page_long` test to cover the 0x64 artist subtype
+- Get `labels_page` passing
+- Add `VarOffsetTail` as an abstraction for trailing var-len data
+- Replace `VarOffsetTail` with `OffsetArray` and add ExplicitPadding
+- Parse rekordbox exportExt.pdb format
+- Convert dump-ext-pdb into flag instead with some guessing magic
+- pdb: Initial index page implementation
+- pdb: Add methods to create new and empty `IndexEntry` instances
+- pdb: Parse MenuItem rows (table 17)
+- Also print playlist content (artist - title) for list-playlists
+- device: Add preliminary high-level API for reading settings
+- cli: Add command to list settings from device export
+- device: Add methods to read playlist entries and tracks
+- cli: Add command to export playlists as M3U
+- pdb: Add History row type
+- xml: Publicise xml structs
+- xml: Publicise members
+- anlz: Add support for 3-band waveforms in 2EX files
+- anlz: Replace FixedUtf16String with LenPrefixedWideString
+- pdb: Encapsulate database reading/writing in a lazy container
+- setting: Improve settings ergonomics
+- xml: Use proper `NaiveDate` format
+- xml: Make fields public
+- xml: Parse ratings
+- xml: Parse position mark colors
+- cli: Add JSON output support for dump cmds
+
+### Refactor
+
+- Simplify `Page` and `RowGroup` parsing
+- Fix test `assert_eq!(result, expected)` parameter order
+- Move `Row::Artist`-specific padding to `Artist` struct
+- Remove length `assert_eq` from roundtrip tests
+- Use `VarOffsetTail` for Artist rows
+- Use `VarOffsetTail` for `Album` struct
+- Move `VarOffsetTail` to its own module
+- Add separate row `Subtype` type
+- Remodel OffsetArray so it can be used with (almost) any type
+- Use OffsetArray for Track rows
+- Cleanup `pdb/offset_array.rs` a little by reducing duplication
+- OffsetArray->OffsetArrayContainer, OffsetArrayImpl->OffsetArray
+- Outline page test buffers
+- pdb: Prepare for index page implementation
+- pdb: Address feedback from @Swiftb0y
+- pdb: Address NITs from @Swiftb0y
+- pdb: Rename get_* methods to into_* to align with `std`
+- pdb: `#[br(temp, assert/#[bw(calc` -> `#[brw(magic` in structs
+- pdb: Remove unused methods from `Page` impl
+- pdb: Address NITs from @Holzhaus and make clippy happy
+- pdb: Remove unneeded explicit padding from tag rows
+- Optimize impl fmt::Display for DeviceSQLString
+- pdb: Rename MenuItem to Menu and add MenuVisibility enum
+- device: Add support for PDB and move code from `main`
+- device: Expose Pdb in DeviceExport and remove wrappers
+- device: Return track references instead of clones
+- cli: Use Pdb abstraction for playlist listing
+- Implement Display for Settings to reduce some duplication
+- main: Improve error handling in dump-pdb
+- xml: Add `xml` feature flag
+- xml: Remove `entries` and rename `tracks` in `Collection`
+- cli: Propagate serde_json errors instead of panicking
+- Improve CLI error handling
+- Shorten syntax of run function removing map_err
+
+### Testing
+
+- pdb: Add genres_page test
+- pdb: Add artists_page test
+- pdb: Move tests to sepparate file
+- pdb: Fix mistake in artists_page test
+- pdb: Corrections after moving tests
+- pdb: WIP added albums_page test
+- pdb: Add labels_page test
+- pdb: Add keys_page test
+- pdb: Add colors_page test and fix colors padding to pass test
+- pdb: Add playlist entry row and page tests
+- pdb: Add playlist tree row and page tests
+- pdb: Add artwork page test
+- pdb: Add tag and track_tag page tests
+- pdb: Add history playlists and entries page tests
+- pdb: Add `index_page` unit test
+- pdb: Add tests for Menu row and page
+- pdb: Add tests for History row
+- anlz: Add roundtrip test for ExtendedCue with empty comment
+- xml: Add empty playlist case to XML test data
+- Add sweep ANLZ fixtures
+- Split sweep fixture test into one test per file
+
 ## [0.3.0] - 2025-01-23
 
 ### Bug Fixes
@@ -31,6 +169,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - pdb: Skip reading rows of invalid pages
+- pdb: Adhere to rows alignment to type alignment when writing
 
 ### Features
 
@@ -40,6 +179,7 @@ All notable changes to this project will be documented in this file.
 - setting: Add `Display` implementation for setting values
 - pdb: Add Columns table
 - pdb: Mark table rows as serializable
+- pdb: Implement support for serialization of table pages
 
 ### Refactor
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Jan Holthuis <jan.holthuis@rub.de>
+// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
 //
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
 // of the MPL was not distributed with this file, You can obtain one at
@@ -7,12 +7,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use binrw::BinRead;
-use clap::{Parser, Subcommand};
-use rekordcrate::anlz::ANLZ;
-use rekordcrate::pdb::{Header, PageType, Row};
-use rekordcrate::setting::Setting;
-use rekordcrate::xml::Document;
-use std::path::PathBuf;
+use clap::{Parser, Subcommand, ValueEnum};
+use fallible_iterator::FallibleIterator;
+use rekordcrate::device::get_playlists;
+use rekordcrate::pdb::io::Database;
+use rekordcrate::pdb::*;
+use rekordcrate::setting::{Setting, SettingType};
+use rekordcrate::{anlz::ANLZ, util::TableIndex};
+#[cfg(feature = "json")]
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use thiserror::Error;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -22,6 +30,35 @@ struct Cli {
     command: Commands,
 }
 
+/// Output format for the dump commands. The `Json` variant is only available when the
+/// `json` feature is enabled; clap's derive drops it from `--format`'s allowed values when absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum DumpFormat {
+    #[default]
+    #[value(name = "debug")]
+    Debug,
+    #[cfg(feature = "json")]
+    #[value(name = "json")]
+    Json,
+}
+
+#[derive(Debug, Error)]
+enum CliError {
+    #[error(transparent)]
+    Rekordcrate(#[from] rekordcrate::Error),
+
+    #[error("{0} is not a file!")]
+    NotAFile(PathBuf),
+
+    #[error("no DB_TYPE supplied nor could it be guessed for {0}!")]
+    CouldNotInferDatabaseType(PathBuf),
+
+    #[error("no SETTING_TYPE supplied nor could it be guessed for {0}!")]
+    CouldNotInferSettingType(PathBuf),
+}
+
+type CliResult<T> = Result<T, CliError>;
+
 #[derive(Subcommand)]
 enum Commands {
     /// List the playlist tree from a Pioneer Database (`.PDB`) file.
@@ -30,25 +67,59 @@ enum Commands {
         #[arg(value_name = "PDB_FILE")]
         path: PathBuf,
     },
+    /// Display settings from a Rekordbox device export.
+    ListSettings {
+        /// Path to parse.
+        #[arg(value_name = "EXPORT_PATH")]
+        path: PathBuf,
+    },
+    /// Export the playlists from a Pioneer Database (`.PDB`) file to M3U files.
+    ExportPlaylists {
+        /// File to parse.
+        #[arg(value_name = "EXPORT_PATH")]
+        path: PathBuf,
+        /// Output directory to write M3U files to.
+        #[arg(value_name = "OUTPUT_DIR")]
+        output_dir: PathBuf,
+    },
     /// Parse and dump a Rekordbox Analysis (`ANLZXXXX.DAT`) file.
     DumpANLZ {
         /// File to parse.
         #[arg(value_name = "ANLZ_FILE")]
         path: PathBuf,
+        /// Output format.
+        #[arg(long, short = 'f', value_enum, default_value_t = DumpFormat::Debug)]
+        format: DumpFormat,
     },
     /// Parse and dump a Pioneer Database (`.PDB`) file.
     DumpPDB {
         /// File to parse.
         #[arg(value_name = "PDB_FILE")]
         path: PathBuf,
+        /// Database type: "plain" (export.pdb) or "ext" (exportExt.pdb). Tries to guess based on file name of not specified.
+        #[arg(long, value_name = "DB_TYPE", value_parser = ["plain", "ext"])]
+        db_type: Option<String>,
+        /// Attempt to parse unknown table types instead of skipping them.
+        #[arg(long)]
+        parse_unknown_tables: bool,
+        /// Output format.
+        #[arg(long, short = 'f', value_enum, default_value_t = DumpFormat::Debug)]
+        format: DumpFormat,
     },
     /// Parse and dump a Pioneer Settings (`*SETTING.DAT`) file.
     DumpSetting {
         /// File to parse.
         #[arg(value_name = "SETTING_FILE")]
         path: PathBuf,
+        /// Setting type.
+        #[arg(long, value_name = "SETTING_TYPE", value_parser = ["devsetting", "djmmysetting", "mysetting", "mysetting2"])]
+        setting_type: Option<String>,
+        /// Output format.
+        #[arg(long, short = 'f', value_enum, default_value_t = DumpFormat::Debug)]
+        format: DumpFormat,
     },
     /// Parse and dump a Pioneer XML (`*.xml`) file.
+    #[cfg(feature = "xml")]
     DumpXML {
         /// File to parse.
         #[arg(value_name = "XML_FILE")]
@@ -56,12 +127,73 @@ enum Commands {
     },
 }
 
-fn list_playlists(path: &PathBuf) -> rekordcrate::Result<()> {
+fn list_playlists(path: &Path) -> rekordcrate::Result<()> {
     use rekordcrate::pdb::{PlaylistTreeNode, PlaylistTreeNodeId};
     use std::collections::HashMap;
 
+    let reader = File::open(path)?;
+    let mut db = Database::open_non_persistent(reader, DatabaseType::Plain)?;
+
+    let mut playlist_tree: HashMap<PlaylistTreeNodeId, Vec<PlaylistTreeNode>> = HashMap::new();
+    let mut playlist_entries: HashMap<PlaylistTreeNodeId, BTreeMap<u32, TrackId>> = HashMap::new();
+    let mut artists: HashMap<ArtistId, Artist> = HashMap::new();
+    let mut tracks: HashMap<TrackId, Track> = HashMap::new();
+
+    db.iter_rows::<PlaylistTreeNode>()?.for_each(|tree_node| {
+        playlist_tree
+            .entry(tree_node.parent_id)
+            .or_default()
+            .push(tree_node.clone());
+        Ok(())
+    })?;
+
+    db.iter_rows::<Artist>()?.for_each(|artist| {
+        artists.insert(artist.id, artist.clone());
+        Ok(())
+    })?;
+
+    db.iter_rows::<Track>()?.for_each(|track| {
+        tracks.insert(track.id, track.clone());
+        Ok(())
+    })?;
+
+    db.iter_rows::<PlaylistEntry>()?.for_each(|entry| {
+        playlist_entries
+            .entry(entry.playlist_id)
+            .or_default()
+            .insert(entry.entry_index, entry.track_id);
+        Ok(())
+    })?;
+
+    fn print_track(
+        track_id: &TrackId,
+        artists: &HashMap<ArtistId, Artist>,
+        tracks: &HashMap<TrackId, Track>,
+    ) {
+        let track = match tracks.get(track_id) {
+            Some(track) => track,
+            None => {
+                println!("<Track for {track_id:?} not found>");
+                return;
+            }
+        };
+        let artist = match artists.get(&track.artist_id) {
+            Some(artist) => artist,
+            None => {
+                println!(
+                    "<Artist for {:?} not found> - {}",
+                    track.artist_id, track.offsets.title
+                );
+                return;
+            }
+        };
+        println!("{} - {}", artist.offsets.name, track.offsets.title)
+    }
     fn print_children_of(
         tree: &HashMap<PlaylistTreeNodeId, Vec<PlaylistTreeNode>>,
+        tree_entries: &HashMap<PlaylistTreeNodeId, BTreeMap<u32, TrackId>>,
+        artists: &HashMap<ArtistId, Artist>,
+        tracks: &HashMap<TrackId, Track>,
         id: PlaylistTreeNodeId,
         level: usize,
     ) {
@@ -69,120 +201,354 @@ fn list_playlists(path: &PathBuf) -> rekordcrate::Result<()> {
             .iter()
             .flat_map(|nodes| nodes.iter())
             .for_each(|node| {
+                let indentation = "    ".repeat(level);
                 println!(
                     "{}{} {}",
-                    "    ".repeat(level),
+                    indentation,
                     if node.is_folder() { "🗀" } else { "🗎" },
-                    node.name.clone().into_string().unwrap(),
+                    node.name,
                 );
-                print_children_of(tree, node.id, level + 1);
+                if let Some(playlist_tracks) = tree_entries.get(&node.id) {
+                    for (index, track_id) in playlist_tracks.iter() {
+                        print!("{}  ♫ {}: ", indentation, index);
+                        print_track(track_id, artists, tracks);
+                    }
+                }
+                print_children_of(tree, tree_entries, artists, tracks, node.id, level + 1);
             });
     }
 
-    let mut reader = std::fs::File::open(path)?;
-    let header = Header::read(&mut reader)?;
+    print_children_of(
+        &playlist_tree,
+        &playlist_entries,
+        &artists,
+        &tracks,
+        PlaylistTreeNodeId(0),
+        0,
+    );
 
-    let mut tree: HashMap<PlaylistTreeNodeId, Vec<PlaylistTreeNode>> = HashMap::new();
+    Ok(())
+}
 
-    header
-        .tables
-        .iter()
-        .filter(|table| table.page_type == PageType::PlaylistTree)
-        .flat_map(|table| {
-            header
-                .read_pages(
-                    &mut reader,
-                    binrw::Endian::NATIVE,
-                    (&table.first_page, &table.last_page),
-                )
-                .unwrap()
+fn export_playlists(path: &Path, output_dir: &Path) -> rekordcrate::Result<()> {
+    use rekordcrate::device::{Playlist, PlaylistNode};
+    use rekordcrate::DeviceExportLoader;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let loader = DeviceExportLoader::new(path.into());
+    let export_path = loader.get_path();
+    let mut db = loader.open_pdb_non_persistent()?;
+
+    let playlists = get_playlists(&mut db)?;
+    let playlist_entries = db
+        .iter_rows::<PlaylistEntry>()?
+        .map(|entry| Ok((entry.playlist_id, (entry.entry_index, entry.track_id))))
+        .fold(
+            HashMap::<PlaylistTreeNodeId, BTreeMap<u32, TrackId>>::new(),
+            |mut acc, (playlist_id, entry)| {
+                // BTreeMap keeps entries sorted by their index in the playlist.
+                acc.entry(playlist_id).or_default().insert(entry.0, entry.1);
+                Ok(acc)
+            },
+        )?;
+
+    let tracks = db
+        .iter_rows::<Track>()?
+        .map(|track| Ok((track.id, track.offsets.file_path.clone().into_string()?)))
+        .collect::<HashMap<_, _>>()?;
+
+    fn walk_tree(
+        node: PlaylistNode,
+        path: &Path,
+        visit: &impl Fn(Playlist, &Path) -> rekordcrate::Result<()>,
+    ) -> rekordcrate::Result<()> {
+        match node {
+            PlaylistNode::Folder(folder) => folder
+                .children
                 .into_iter()
-                .flat_map(|page| page.row_groups.into_iter())
-                .flat_map(|row_group| {
-                    row_group
-                        .present_rows()
-                        .map(|row| {
-                            if let Row::PlaylistTreeNode(playlist_tree) = row {
-                                playlist_tree
-                            } else {
-                                unreachable!("encountered non-playlist tree row in playlist table");
-                            }
-                        })
-                        .collect::<Vec<PlaylistTreeNode>>()
-                        .into_iter()
-                })
-        })
-        .for_each(|row| tree.entry(row.parent_id).or_default().push(row));
+                .try_for_each(|child| walk_tree(child, &path.join(&folder.name), visit)),
+            PlaylistNode::Playlist(playlist) => visit(playlist, path),
+        }
+    }
 
-    print_children_of(&tree, PlaylistTreeNodeId(0), 0);
+    playlists.into_iter().try_for_each(|node| {
+        walk_tree(node, output_dir, &|playlist, path| {
+            std::fs::create_dir_all(path)?;
+            let playlist_path = path.join(format!("{}.m3u", playlist.name));
 
-    Ok(())
-}
-
-fn dump_anlz(path: &PathBuf) -> rekordcrate::Result<()> {
-    let mut reader = std::fs::File::open(path)?;
-    let anlz = ANLZ::read(&mut reader)?;
-    println!("{:#?}", anlz);
-
-    Ok(())
-}
-
-fn dump_pdb(path: &PathBuf) -> rekordcrate::Result<()> {
-    let mut reader = std::fs::File::open(path)?;
-    let header = Header::read(&mut reader)?;
-
-    println!("{:#?}", header);
-
-    for (i, table) in header.tables.iter().enumerate() {
-        println!("Table {}: {:?}", i, table.page_type);
-        for page in header
-            .read_pages(
-                &mut reader,
-                binrw::Endian::NATIVE,
-                (&table.first_page, &table.last_page),
-            )
-            .unwrap()
-            .into_iter()
-        {
-            println!("  {:?}", page);
-            page.row_groups.iter().for_each(|row_group| {
-                println!("    {:?}", row_group);
-                for row in row_group.present_rows() {
-                    println!("      {:?}", row);
+            println!("{}", playlist_path.display());
+            let mut file = File::create(playlist_path)?;
+            if let Some(entries) = playlist_entries.get(&playlist.id) {
+                for track in entries.values().filter_map(|track_id| tracks.get(track_id)) {
+                    writeln!(
+                        &mut file,
+                        "{}",
+                        export_path
+                            .canonicalize()?
+                            .join(track.strip_prefix('/').unwrap_or(track))
+                            .display(),
+                    )?;
                 }
-            })
+            }
+            Ok(())
+        })
+    })?;
+
+    Ok(())
+}
+
+fn list_settings(path: &Path) -> rekordcrate::Result<()> {
+    use rekordcrate::DeviceExportLoader;
+
+    let loader = DeviceExportLoader::new(path.into());
+    let settings = loader.load_settings();
+
+    print!("{}", settings);
+
+    Ok(())
+}
+
+fn dump_anlz(path: &Path, format: DumpFormat) -> rekordcrate::Result<()> {
+    let mut reader = File::open(path)?;
+    let anlz = ANLZ::read(&mut reader)?;
+    match format {
+        #[cfg(feature = "json")]
+        DumpFormat::Json => println!("{}", serde_json::to_string_pretty(&anlz)?),
+        DumpFormat::Debug => println!("{:#?}", anlz),
+    }
+
+    Ok(())
+}
+
+/// A table and all of its pages, for JSON serialization.
+#[cfg(feature = "json")]
+#[derive(Serialize)]
+struct TableDump {
+    page_type: PageType,
+    pages: Vec<Page>,
+}
+
+/// The full PDB dump (header + tables), for JSON serialization.
+#[cfg(feature = "json")]
+#[derive(Serialize)]
+struct PdbDump {
+    header: Header,
+    tables: Vec<TableDump>,
+}
+
+fn dump_pdb(
+    path: &Path,
+    typ: DatabaseType,
+    parse_unknown_tables: bool,
+    format: DumpFormat,
+) -> rekordcrate::Result<()> {
+    let reader = File::open(path)?;
+    let mut db = Database::open_non_persistent(reader, typ)?;
+
+    // `format` is only consulted under the json feature; bind it to avoid an unused-variable
+    // warning when building with `cli` alone.
+    #[cfg(not(feature = "json"))]
+    let _ = format;
+
+    #[cfg(feature = "json")]
+    if matches!(format, DumpFormat::Json) {
+        let header = db.get_header().clone();
+        let mut tables = Vec::new();
+        for (i, table) in header.tables.iter().enumerate() {
+            let id = TableIndex::from(i);
+            // Honor the same skip rule as the debug path so JSON output stays consistent.
+            if matches!(table.page_type, PageType::Unknown(_)) && !parse_unknown_tables {
+                continue;
+            }
+            let mut pages = Vec::new();
+            let mut page_iter = db.iter_pages_for_table(id)?;
+            while let Some(page) = page_iter.next()? {
+                pages.push(page.clone());
+            }
+            tables.push(TableDump {
+                page_type: table.page_type,
+                pages,
+            });
+        }
+        let dump = PdbDump { header, tables };
+        println!("{}", serde_json::to_string_pretty(&dump)?);
+        return Ok(());
+    }
+
+    println!("{:#?}", db.get_header());
+
+    fn dump_table(db: &mut Database<File>, id: TableIndex) -> rekordcrate::Result<()> {
+        let mut page_iter = db.iter_pages_for_table(id)?;
+        while let Some(page) = page_iter.next()? {
+            println!("  {:?}", page);
+            match &page.content {
+                PageContent::Data(data_content) => {
+                    for row in data_content.rows.values() {
+                        println!("      {:?}", row);
+                    }
+                }
+                PageContent::Index(index_content) => {
+                    println!("    {:?}", index_content);
+                    for entry in index_content.entries.iter() {
+                        println!("      {:?}", entry);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let tables = db.get_header().tables.clone();
+    for (i, table) in tables.iter().enumerate() {
+        let id = TableIndex::from(i);
+        println!("Table {:?}: {:?}", id, table.page_type);
+        if matches!(table.page_type, PageType::Unknown(_)) && !parse_unknown_tables {
+            println!(
+                "  Skipping unknown table type, use --parse-unknown-tables to attempt parsing"
+            );
+            continue;
+        }
+        if let Err(e) = dump_table(&mut db, id) {
+            eprintln!("Error dumping table {:?}: {e}", id);
         }
     }
 
     Ok(())
 }
 
-fn dump_setting(path: &PathBuf) -> rekordcrate::Result<()> {
-    let mut reader = std::fs::File::open(path)?;
-    let setting = Setting::read(&mut reader)?;
+fn dump_setting(
+    path: &Path,
+    setting_type: SettingType,
+    format: DumpFormat,
+) -> rekordcrate::Result<()> {
+    let mut reader = File::open(path)?;
+    let setting = Setting::read_args(&mut reader, (setting_type,))?;
 
-    println!("{:#04x?}", setting);
+    match format {
+        #[cfg(feature = "json")]
+        DumpFormat::Json => println!("{}", serde_json::to_string_pretty(&setting)?),
+        DumpFormat::Debug => println!("{:#04x?}", setting),
+    }
 
     Ok(())
 }
 
-fn dump_xml(path: &PathBuf) -> rekordcrate::Result<()> {
+#[cfg(feature = "xml")]
+fn dump_xml(path: &Path) -> rekordcrate::Result<()> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let document: Document = quick_xml::de::from_reader(reader).expect("failed to deserialize XML");
+    let document: rekordcrate::xml::Document = quick_xml::de::from_reader(reader)?;
     println!("{:#?}", document);
 
     Ok(())
 }
 
-fn main() -> rekordcrate::Result<()> {
+fn guess_db_type(path: &Path, db_type: Option<&str>) -> CliResult<DatabaseType> {
+    let db_type_cli = db_type.map(|str| match str {
+        "plain" => DatabaseType::Plain,
+        "ext" => DatabaseType::Ext,
+        invalid => unreachable!("invalid flag {invalid}, should have already been checked by clap"),
+    });
+    let file_name = match path.file_name() {
+        None => {
+            return Err(CliError::NotAFile(path.to_path_buf()));
+        }
+        Some(file_name) => file_name,
+    };
+    let db_type_file = if file_name == "export.pdb" {
+        Some(DatabaseType::Plain)
+    } else if file_name == "exportExt.pdb" {
+        Some(DatabaseType::Ext)
+    } else {
+        None
+    };
+    let db_type = match (db_type_cli, db_type_file) {
+        (None, None) => {
+            return Err(CliError::CouldNotInferDatabaseType(path.to_path_buf()));
+        }
+        (None, Some(guess)) | (Some(guess), None) => guess,
+        (Some(db_type_cli), Some(db_type_file)) if db_type_cli == db_type_file => db_type_cli,
+        (Some(db_type_cli), Some(db_type_file)) => {
+            eprintln!("Warning: passed {db_type_cli:?}, but found {db_type_file:?} from file name, using {db_type_cli:?}!");
+            db_type_cli
+        }
+    };
+    Ok(db_type)
+}
+
+fn guess_setting_type(path: &Path, setting_type: Option<&str>) -> CliResult<SettingType> {
+    let setting_type_cli = setting_type.map(|str| match str {
+        "devsetting" => SettingType::DevSetting,
+        "djmmysetting" => SettingType::DJMMySetting,
+        "mysetting" => SettingType::MySetting,
+        "mysetting2" => SettingType::MySetting2,
+        invalid => {
+            unreachable!("invalid flag {invalid}, should have already been checked by clap")
+        }
+    });
+    let file_name = match path.file_name() {
+        None => {
+            return Err(CliError::NotAFile(path.to_path_buf()));
+        }
+        Some(file_name) => file_name,
+    };
+    let setting_type_file = SettingType::from_filename(file_name);
+    let setting_type = match (setting_type_cli, setting_type_file) {
+        (None, None) => {
+            return Err(CliError::CouldNotInferSettingType(path.to_path_buf()));
+        }
+        (None, Some(guess)) | (Some(guess), None) => guess,
+        (Some(setting_type_cli), Some(setting_type_file))
+            if setting_type_cli == setting_type_file =>
+        {
+            setting_type_cli
+        }
+        (Some(setting_type_cli), Some(setting_type_file)) => {
+            eprintln!("Warning: passed {setting_type_cli:?}, but found {setting_type_file:?} from file name, using {setting_type_cli:?}!");
+            setting_type_cli
+        }
+    };
+    Ok(setting_type)
+}
+
+fn run() -> CliResult<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::ListPlaylists { path } => list_playlists(path),
-        Commands::DumpPDB { path } => dump_pdb(path),
-        Commands::DumpANLZ { path } => dump_anlz(path),
-        Commands::DumpSetting { path } => dump_setting(path),
-        Commands::DumpXML { path } => dump_xml(path),
+        Commands::ListPlaylists { path } => list_playlists(path)?,
+        Commands::ListSettings { path } => list_settings(path)?,
+        Commands::ExportPlaylists { path, output_dir } => export_playlists(path, output_dir)?,
+        Commands::DumpPDB {
+            path,
+            db_type,
+            parse_unknown_tables,
+            format,
+        } => {
+            let db_type = guess_db_type(path, db_type.as_deref())?;
+            dump_pdb(path, db_type, *parse_unknown_tables, *format)?
+        }
+        Commands::DumpANLZ { path, format } => dump_anlz(path, *format)?,
+        Commands::DumpSetting {
+            path,
+            setting_type,
+            format,
+        } => {
+            let setting_type = guess_setting_type(path, setting_type.as_deref())?;
+            dump_setting(path, setting_type, *format)?
+        }
+        #[cfg(feature = "xml")]
+        Commands::DumpXML { path } => dump_xml(path)?,
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
     }
 }
